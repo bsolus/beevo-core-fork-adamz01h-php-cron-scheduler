@@ -254,10 +254,10 @@ class Job
      * The job id is used as a filename for the lock file.
      *
      * @param  string    $tempDir          The directory path for the lock files
-     * @param  callable  $whenOverlapping  A callback to ignore job overlapping
+     * @param  callable|null  $whenOverlapping  A callback to ignore job overlapping
      * @return self
      */
-    public function onlyOne($tempDir = null, callable $whenOverlapping = null)
+    public function onlyOne($tempDir = null, ?callable $whenOverlapping = null)
     {
         if ($tempDir === null || ! is_dir($tempDir)) {
             $tempDir = $this->tempDir;
