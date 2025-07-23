@@ -1,5 +1,5 @@
 {
-    "name": "adamz01h/php-cron-scheduler",
+    "name": "bsolus/php-cron-scheduler",
     "description": "PHP Cron Job Scheduler",
     "license": "MIT",
     "keywords": ["cron job", "scheduler", "windows"],
@@ -17,6 +17,10 @@
         {
            "name": "adamz01h",
            "role": "Contributor"
+        },
+        {
+            "name": "dfernandesbsolus",
+            "role": "Contributor"
         }
     ],
     "minimum-stability": "dev",
