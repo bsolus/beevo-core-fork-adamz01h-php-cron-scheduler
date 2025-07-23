@@ -1,4 +1,8 @@
-<?php namespace GO;
+<?php
+
+declare(strict_types=1);
+
+namespace GO;
 
 use DateTime;
 use Exception;
@@ -6,8 +10,8 @@ use InvalidArgumentException;
 
 class Job
 {
-    use Traits\Interval,
-        Traits\Mailer;
+    use Traits\Interval;
+    use Traits\Mailer;
 
     /**
      * Job identifier.
@@ -56,7 +60,7 @@ class Job
      *
      * @var string
      */
-    private $executionYear = null;
+    private $executionYear;
 
     /**
      * Temporary directory path for
@@ -146,9 +150,9 @@ class Job
     /**
      * Create a new Job instance.
      *
-     * @param  string|callable  $command
-     * @param  array            $args
-     * @param  string           $id
+     * @param string|callable $command
+     * @param array           $args
+     * @param string          $id
      */
     public function __construct($command, $args = [], $id = null)
     {
@@ -160,7 +164,7 @@ class Job
             } elseif (is_array($command)) {
                 $this->id = md5(serialize($command));
             } else {
-                /* @var object $command */
+                // @var object $command
                 $this->id = spl_object_hash($command);
             }
         }
@@ -190,13 +194,14 @@ class Job
      * the job is due. Defaults to job creation time.
      * It also defaults the execution time if not previously defined.
      *
-     * @param  DateTime  $date
+     * @param DateTime $date
+     *
      * @return bool
      */
-    public function isDue(DateTime $date = null)
+    public function isDue(?DateTime $date = null)
     {
         // The execution time is being defaulted if not defined
-        if (! $this->executionTime) {
+        if (!$this->executionTime) {
             $this->at('* * * * *');
         }
 
@@ -216,9 +221,9 @@ class Job
      */
     public function isOverlapping()
     {
-        return $this->lockFile &&
-               file_exists($this->lockFile) &&
-               call_user_func($this->whenOverlapping, filemtime($this->lockFile)) === false;
+        return $this->lockFile
+               && file_exists($this->lockFile)
+               && call_user_func($this->whenOverlapping, filemtime($this->lockFile)) === false;
     }
 
     /**
@@ -253,36 +258,35 @@ class Job
      * being executed if the previous is still running.
      * The job id is used as a filename for the lock file.
      *
-     * @param  string    $tempDir          The directory path for the lock files
-     * @param  callable|null  $whenOverlapping  A callback to ignore job overlapping
+     * @param string        $tempDir         The directory path for the lock files
+     * @param callable|null $whenOverlapping A callback to ignore job overlapping
+     *
      * @return self
      */
     public function onlyOne($tempDir = null, ?callable $whenOverlapping = null)
     {
-        if ($tempDir === null || ! is_dir($tempDir)) {
+        if ($tempDir === null || !is_dir($tempDir)) {
             $tempDir = $this->tempDir;
         }
 
-         if(file_exists('/dev/null')){
-             //linux systems
-             $this->lockFile = implode('/', [
-                 trim($tempDir),
-                 trim($this->id) . '.lock',
-             ]);
-         }else{
-             //windows systems need back slashes for file paths
-             $this->lockFile = implode('\\', [
-                 trim(str_replace('/', '\\', $tempDir)),
-                 trim($this->id) . '.lock',
-             ]);
-         }
+        if (file_exists('/dev/null')) {
+            // linux systems
+            $this->lockFile = implode('/', [
+                trim($tempDir),
+                trim($this->id) . '.lock',
+            ]);
+        } else {
+            // windows systems need back slashes for file paths
+            $this->lockFile = implode('\\', [
+                trim(str_replace('/', '\\', $tempDir)),
+                trim($this->id) . '.lock',
+            ]);
+        }
 
         if ($whenOverlapping) {
             $this->whenOverlapping = $whenOverlapping;
         } else {
-            $this->whenOverlapping = function () {
-                return false;
-            };
+            $this->whenOverlapping = fn () => false;
         }
 
         return $this;
@@ -312,15 +316,15 @@ class Job
 
         // Add the boilerplate to redirect the output to file/s
         if (count($this->outputTo) > 0) {
-            if(file_exists('/dev/null')){
-                //linux systems
-                 $compiled .= ' | tee ';
-                 $compiled .= $this->outputMode === 'a' ? '-a ' : '';
-             }else{
-                //windows systems
-                 $compiled .= ' ';
-                 $compiled .= $this->outputMode === 'a' ? '>> ' : '> ';
-             }
+            if (file_exists('/dev/null')) {
+                // linux systems
+                $compiled .= ' | tee ';
+                $compiled .= $this->outputMode === 'a' ? '-a ' : '';
+            } else {
+                // windows systems
+                $compiled .= ' ';
+                $compiled .= $this->outputMode === 'a' ? '>> ' : '> ';
+            }
             foreach ($this->outputTo as $file) {
                 $compiled .= $file . ' ';
             }
@@ -330,11 +334,11 @@ class Job
 
         // Add boilerplate to remove lockfile after execution
         if ($this->lockFile) {
-           if(file_exists('/dev/null')){
-                //linux systems
+            if (file_exists('/dev/null')) {
+                // linux systems
                 $compiled .= '; rm ' . $this->lockFile;
-            }else{
-                //windows systems
+            } else {
+                // windows systems
                 $compiled .= ' & del ' . $this->lockFile;
             }
         }
@@ -343,11 +347,11 @@ class Job
         if ($this->canRunInBackground()) {
             // Parentheses are need execute the chain of commands in a subshell
             // that can then run in background
-            if(file_exists('/dev/null')){
-                //linux systems
+            if (file_exists('/dev/null')) {
+                // linux systems
                 $compiled = '(' . $compiled . ') > /dev/null 2>&1 &';
-            }else{
-                //windows systems
+            } else {
+                // windows systems
                 $compiled = '(' . $compiled . ') > NUL 2>&1';
             }
         }
@@ -358,13 +362,14 @@ class Job
     /**
      * Configure the job.
      *
-     * @param  array  $config
+     * @param array $config
+     *
      * @return self
      */
     public function configure(array $config = [])
     {
         if (isset($config['email'])) {
-            if (! is_array($config['email'])) {
+            if (!is_array($config['email'])) {
                 throw new InvalidArgumentException('Email configuration should be an array.');
             }
             $this->emailConfig = $config['email'];
@@ -381,7 +386,8 @@ class Job
     /**
      * Truth test to define if the job should run if due.
      *
-     * @param  callable  $fn
+     * @param callable $fn
+     *
      * @return self
      */
     public function when(callable $fn)
@@ -431,13 +437,14 @@ class Job
     /**
      * Create the job lock file.
      *
-     * @param  mixed  $content
+     * @param mixed $content
+     *
      * @return void
      */
-    private function createLockFile($content = null)
+    private function createLockFile($content = null): void
     {
         if ($this->lockFile) {
-            if ($content === null || ! is_string($content)) {
+            if ($content === null || !is_string($content)) {
                 $content = $this->getId();
             }
 
@@ -450,7 +457,7 @@ class Job
      *
      * @return void
      */
-    private function removeLockFile()
+    private function removeLockFile(): void
     {
         if ($this->lockFile && file_exists($this->lockFile)) {
             unlink($this->lockFile);
@@ -460,9 +467,11 @@ class Job
     /**
      * Execute a callable job.
      *
-     * @param  callable  $fn
-     * @throws Exception
+     * @param callable $fn
+     *
      * @return string
+     *
+     * @throws Exception
      */
     private function exec(callable $fn)
     {
@@ -472,6 +481,7 @@ class Job
             $returnData = call_user_func_array($fn, $this->args);
         } catch (Exception $e) {
             ob_end_clean();
+
             throw $e;
         }
 
@@ -495,8 +505,9 @@ class Job
     /**
      * Set the file/s where to write the output of the job.
      *
-     * @param  string|array  $filename
-     * @param  bool          $append
+     * @param string|array $filename
+     * @param bool         $append
+     *
      * @return self
      */
     public function output($filename, $append = false)
@@ -522,12 +533,13 @@ class Job
      * The Job should be set to write output to a file
      * for this to work.
      *
-     * @param  string|array  $email
+     * @param string|array $email
+     *
      * @return self
      */
     public function email($email)
     {
-        if (! is_string($email) && ! is_array($email)) {
+        if (!is_string($email) && !is_array($email)) {
             throw new InvalidArgumentException('The email can be only string or array');
         }
 
@@ -544,7 +556,7 @@ class Job
      *
      * @return void
      */
-    private function finalise()
+    private function finalise(): void
     {
         // Send output to email
         $this->emailOutput();
@@ -562,13 +574,13 @@ class Job
      */
     private function emailOutput()
     {
-        if (! count($this->outputTo) || ! count($this->emailTo)) {
+        if (!count($this->outputTo) || !count($this->emailTo)) {
             return false;
         }
 
-        if (isset($this->emailConfig['ignore_empty_output']) &&
-            $this->emailConfig['ignore_empty_output'] === true &&
-            empty($this->output)
+        if (isset($this->emailConfig['ignore_empty_output'])
+            && $this->emailConfig['ignore_empty_output'] === true
+            && empty($this->output)
         ) {
             return false;
         }
@@ -583,6 +595,7 @@ class Job
      * Job object is injected as a parameter to callable function.
      *
      * @param callable $fn
+     *
      * @return self
      */
     public function before(callable $fn)
@@ -600,8 +613,9 @@ class Job
      * second parameter. The job will run in background if it
      * meets all the other criteria.
      *
-     * @param  callable  $fn
-     * @param  bool      $runInBackground
+     * @param callable $fn
+     * @param bool     $runInBackground
+     *
      * @return self
      */
     public function then(callable $fn, $runInBackground = false)

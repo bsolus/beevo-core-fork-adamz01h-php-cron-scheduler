@@ -1,4 +1,8 @@
-<?php namespace GO;
+<?php
+
+declare(strict_types=1);
+
+namespace GO;
 
 use DateTime;
 use Exception;
@@ -42,7 +46,7 @@ class Scheduler
     /**
      * Create new instance.
      *
-     * @param  array  $config
+     * @param array $config
      */
     public function __construct(array $config = [])
     {
@@ -52,10 +56,11 @@ class Scheduler
     /**
      * Queue a job for execution in the correct queue.
      *
-     * @param  Job  $job
+     * @param Job $job
+     *
      * @return void
      */
-    private function queueJob(Job $job)
+    private function queueJob(Job $job): void
     {
         $this->jobs[] = $job;
     }
@@ -94,9 +99,10 @@ class Scheduler
     /**
      * Queues a function execution.
      *
-     * @param  callable  $fn  The function to execute
-     * @param  array  $args  Optional arguments to pass to the php script
-     * @param  string  $id   Optional custom identifier
+     * @param callable $fn   The function to execute
+     * @param array    $args Optional arguments to pass to the php script
+     * @param string   $id   Optional custom identifier
+     *
      * @return Job
      */
     public function call(callable $fn, $args = [], $id = null)
@@ -111,24 +117,25 @@ class Scheduler
     /**
      * Queues a php script execution.
      *
-     * @param  string  $script  The path to the php script to execute
-     * @param  string  $bin     Optional path to the php binary
-     * @param  array  $args     Optional arguments to pass to the php script
-     * @param  string  $id      Optional custom identifier
+     * @param string $script The path to the php script to execute
+     * @param string $bin    Optional path to the php binary
+     * @param array  $args   Optional arguments to pass to the php script
+     * @param string $id     Optional custom identifier
+     *
      * @return Job
      */
     public function php($script, $bin = null, $args = [], $id = null)
     {
-        if (! is_string($script)) {
+        if (!is_string($script)) {
             throw new InvalidArgumentException('The script should be a valid path to a file.');
         }
 
-        $bin = $bin !== null && is_string($bin) && file_exists($bin) ?
-            $bin : (PHP_BINARY === '' ? '/usr/bin/php' : PHP_BINARY);
+        $bin = $bin !== null && is_string($bin) && file_exists($bin)
+            ? $bin : (PHP_BINARY === '' ? '/usr/bin/php' : PHP_BINARY);
 
         $job = new Job($bin . ' ' . $script, $args, $id);
 
-        if (! file_exists($script)) {
+        if (!file_exists($script)) {
             $this->pushFailedJob(
                 $job,
                 new InvalidArgumentException('The script should be a valid path to a file.')
@@ -143,9 +150,10 @@ class Scheduler
     /**
      * Queue a raw shell command.
      *
-     * @param  string  $command  The command to execute
-     * @param  array  $args      Optional arguments to pass to the command
-     * @param  string  $id       Optional custom identifier
+     * @param string $command The command to execute
+     * @param array  $args    Optional arguments to pass to the command
+     * @param string $id      Optional custom identifier
+     *
      * @return Job
      */
     public function raw($command, $args = [], $id = null)
@@ -160,10 +168,11 @@ class Scheduler
     /**
      * Run the scheduler.
      *
-     * @param  DateTime  $runTime  Optional, run at specific moment
-     * @return array  Executed jobs
+     * @param DateTime|null $runTime Optional, run at specific moment
+     *
+     * @return array Executed jobs
      */
-    public function run(Datetime $runTime = null)
+    public function run(?DateTime $runTime = null)
     {
         $jobs = $this->getQueuedJobs();
 
@@ -176,7 +185,7 @@ class Scheduler
                 try {
                     $job->run();
                     $this->pushExecutedJob($job);
-                } catch (\Exception $e) {
+                } catch (Exception $e) {
                     $this->pushFailedJob($job, $e);
                 }
             }
@@ -203,12 +212,13 @@ class Scheduler
     /**
      * Add an entry to the scheduler verbose output array.
      *
-     * @param  string  $string
+     * @param string $string
+     *
      * @return void
      */
-    private function addSchedulerVerboseOutput($string)
+    private function addSchedulerVerboseOutput($string): void
     {
-        $now = '[' . (new DateTime('now'))->format('c') . '] ';
+        $now = '[' . new DateTime('now')->format('c') . '] ';
         $this->outputSchedule[] = $now . $string;
 
         // Print to stdoutput in light gray
@@ -218,7 +228,8 @@ class Scheduler
     /**
      * Push a succesfully executed job.
      *
-     * @param  Job  $job
+     * @param Job $job
+     *
      * @return Job
      */
     private function pushExecutedJob(Job $job)
@@ -250,8 +261,9 @@ class Scheduler
     /**
      * Push a failed job.
      *
-     * @param  Job  $job
-     * @param  Exception  $e
+     * @param Job       $job
+     * @param Exception $e
+     *
      * @return Job
      */
     private function pushFailedJob(Job $job, Exception $e)
@@ -283,18 +295,22 @@ class Scheduler
     /**
      * Get the scheduler verbose output.
      *
-     * @param  string  $type  Allowed: text, html, array
-     * @return mixed  The return depends on the requested $type
+     * @param string $type Allowed: text, html, array
+     *
+     * @return mixed The return depends on the requested $type
      */
     public function getVerboseOutput($type = 'text')
     {
         switch ($type) {
             case 'text':
                 return implode("\n", $this->outputSchedule);
+
             case 'html':
                 return implode('<br>', $this->outputSchedule);
+
             case 'array':
                 return $this->outputSchedule;
+
             default:
                 throw new InvalidArgumentException('Invalid output type');
         }
