@@ -1,13 +1,31 @@
-<?php namespace GO;
+<?php
+
+declare(strict_types=1);
+
+namespace GO;
 
 use DateTime;
 use Exception;
 use InvalidArgumentException;
+use Memcached;
+use Redis;
+use RuntimeException;
+use Symfony\Component\Lock\BlockingStoreInterface;
+use Symfony\Component\Lock\Key;
+use Symfony\Component\Lock\LockFactory;
+use Symfony\Component\Lock\LockInterface;
+use Symfony\Component\Lock\PersistingStoreInterface;
+use Symfony\Component\Lock\SharedLockStoreInterface;
+use Symfony\Component\Lock\Store\FlockStore;
+use Symfony\Component\Lock\Store\MemcachedStore;
+use Symfony\Component\Lock\Store\PdoStore;
+use Symfony\Component\Lock\Store\RedisStore;
+use Symfony\Component\Lock\Store\SemaphoreStore;
 
 class Job
 {
-    use Traits\Interval,
-        Traits\Mailer;
+    use Traits\Interval;
+    use Traits\Mailer;
 
     /**
      * Job identifier.
@@ -56,7 +74,7 @@ class Job
      *
      * @var string
      */
-    private $executionYear = null;
+    private $executionYear;
 
     /**
      * Temporary directory path for
@@ -144,34 +162,91 @@ class Job
     private $outputMode;
 
     /**
+     * Whether this job should use locking.
+     *
+     * @var bool
+     */
+    private bool $lockable = false;
+
+    /**
+     * The Symfony Lock instance.
+     *
+     * @var LockInterface|null
+     */
+    private ?LockInterface $lock = null;
+
+    /**
+     * Lock configuration from scheduler.
+     *
+     * @var array<string, mixed>
+     */
+    private array $lockConfig = [];
+
+    /**
+     * Static lock factory instance (shared across jobs).
+     *
+     * @var LockFactory|null
+     */
+    private static ?LockFactory $lockFactory = null;
+
+    /**
+     * Static lock store instance (shared across jobs).
+     *
+     * @var SharedLockStoreInterface|PersistingStoreInterface|BlockingStoreInterface|null
+     */
+    private static SharedLockStoreInterface|PersistingStoreInterface|BlockingStoreInterface|null $lockStore = null;
+
+    /**
      * Create a new Job instance.
      *
-     * @param  string|callable  $command
-     * @param  array            $args
-     * @param  string           $id
+     * @param string|callable $command
+     * @param array           $args
+     * @param string          $id
      */
-    public function __construct($command, $args = [], $id = null)
+    /**
+     * Create a new Job instance.
+     *
+     * @param string|callable      $command The command or function to execute
+     * @param array<string, mixed> $args    Arguments for the command
+     * @param string|null          $id      Optional job identifier
+     */
+    public function __construct($command, array $args = [], ?string $id = null)
     {
-        if (is_string($id)) {
-            $this->id = $id;
-        } else {
-            if (is_string($command)) {
-                $this->id = md5($command);
-            } elseif (is_array($command)) {
-                $this->id = md5(serialize($command));
-            } else {
-                /* @var object $command */
-                $this->id = spl_object_hash($command);
-            }
-        }
-
-        $this->creationTime = new DateTime('now');
-
-        // initialize the directory path for lock files
-        $this->tempDir = sys_get_temp_dir();
-
         $this->command = $command;
         $this->args = $args;
+        $this->creationTime = new DateTime('now');
+        $this->tempDir = sys_get_temp_dir();
+
+        // Generate ID if not provided
+        if ($id !== null) {
+            $this->id = $id;
+        } else {
+            $this->id = $this->generateId($command);
+        }
+    }
+
+    /**
+     * Generate job ID based on command.
+     *
+     * @param string|callable|array<mixed> $command The command
+     *
+     * @return string
+     */
+    private function generateId($command): string
+    {
+        if (is_string($command)) {
+            return md5($command);
+        }
+
+        if (is_array($command)) {
+            return md5(serialize($command));
+        }
+
+        if (is_object($command)) {
+            return spl_object_hash($command);
+        }
+
+        return md5(uniqid('job_', true));
     }
 
     /**
@@ -185,18 +260,51 @@ class Job
     }
 
     /**
+     * Configure the job with scheduler settings.
+     *
+     * @param array<string, mixed> $config Configuration array
+     *
+     * @return self
+     */
+    public function configure(array $config = []): self
+    {
+        // Configure email settings
+        if (isset($config['email']) && is_array($config['email'])) {
+            $this->emailConfig = $config['email'];
+        }
+
+        // Configure temp directory
+        if (isset($config['tempDir']) && is_string($config['tempDir'])) {
+            if (!is_dir($config['tempDir'])) {
+                throw new InvalidArgumentException(
+                    sprintf('Temp directory "%s" does not exist', $config['tempDir'])
+                );
+            }
+            $this->tempDir = $config['tempDir'];
+        }
+
+        // Configure lock settings
+        if (isset($config['lock']) && is_array($config['lock'])) {
+            $this->lockConfig = $config['lock'];
+        }
+
+        return $this;
+    }
+
+    /**
      * Check if the Job is due to run.
      * It accepts as input a DateTime used to check if
      * the job is due. Defaults to job creation time.
      * It also defaults the execution time if not previously defined.
      *
-     * @param  DateTime  $date
+     * @param DateTime $date
+     *
      * @return bool
      */
-    public function isDue(DateTime $date = null)
+    public function isDue(?DateTime $date = null)
     {
         // The execution time is being defaulted if not defined
-        if (! $this->executionTime) {
+        if (!$this->executionTime) {
             $this->at('* * * * *');
         }
 
@@ -210,15 +318,210 @@ class Job
     }
 
     /**
-     * Check if the Job is overlapping.
+     * Check if the Job is overlapping using configured lock adapter.
      *
      * @return bool
      */
-    public function isOverlapping()
+    public function isOverlapping(): bool
     {
-        return $this->lockFile &&
-               file_exists($this->lockFile) &&
-               call_user_func($this->whenOverlapping, filemtime($this->lockFile)) === false;
+        if (!$this->lockable || empty($this->lockConfig['enabled'])) {
+            return false;
+        }
+
+        try {
+            $factory = $this->getLockFactory();
+            $lockId = $this->getLockId();
+
+            // Try to acquire a test lock with minimal TTL
+            $testLock = $factory->createLock($lockId, 0.1);
+
+            if ($testLock->acquire(false)) {
+                $testLock->release();
+
+                return false;
+            }
+
+            return true;
+        } catch (Exception $e) {
+            // Log error but don't fail the check
+            error_log(sprintf('Failed to check overlap for job %s: %s', $this->id, $e->getMessage()));
+
+            return false;
+        }
+    }
+
+    /**
+     * Get lock ID for this job.
+     *
+     * @return string
+     */
+    private function getLockId(): string
+    {
+        $prefix = $this->lockConfig['prefix'] ?? 'cron_lock_';
+
+        return $prefix . $this->id;
+    }
+
+    /**
+     * Get or create the lock factory.
+     *
+     * @return LockFactory
+     *
+     * @throws RuntimeException If lock store cannot be created
+     */
+    private function getLockFactory(): LockFactory
+    {
+        if (self::$lockFactory === null || self::$lockStore === null) {
+            self::$lockStore = $this->createLockStore();
+            self::$lockFactory = new LockFactory(self::$lockStore);
+        }
+
+        return self::$lockFactory;
+    }
+
+    /**
+     * Create the appropriate lock store based on configuration.
+     *
+     * @return SharedLockStoreInterface
+     *
+     * @throws RuntimeException If store cannot be created
+     */
+    private function createLockStore(): SharedLockStoreInterface|PersistingStoreInterface|BlockingStoreInterface
+    {
+        $adapter = $this->lockConfig['adapter'] ?? 'flock';
+
+        try {
+            switch ($adapter) {
+                case 'redis':
+                    return $this->createRedisStore();
+
+                case 'pdo':
+                    return $this->createPdoStore();
+
+                case 'memcached':
+                    return $this->createMemcachedStore();
+
+                case 'semaphore':
+                    return new SemaphoreStore();
+
+                case 'flock':
+                default:
+                    return $this->createFlockStore();
+            }
+        } catch (Exception $e) {
+            throw new RuntimeException(
+                sprintf('Failed to create %s lock store: %s', $adapter, $e->getMessage()),
+                0,
+                $e
+            );
+        }
+    }
+
+    /**
+     * Create Redis lock store.
+     *
+     * @return RedisStore
+     *
+     * @throws RuntimeException If Redis connection fails
+     */
+    private function createRedisStore(): RedisStore
+    {
+        $config = $this->lockConfig['redis'] ?? [];
+
+        $host = $config['host'] ?? '127.0.0.1';
+        $port = (int) ($config['port'] ?? 6379);
+        $timeout = (float) ($config['timeout'] ?? 5.0);
+        $password = $config['password'] ?? null;
+        $database = (int) ($config['database'] ?? 0);
+        $persistent = (bool) ($config['persistent'] ?? false);
+        $persistentId = $config['persistent_id'] ?? null;
+
+        $redis = new Redis();
+
+        // Connect with retry logic
+        $maxRetries = 3;
+        $connected = false;
+        $lastException = null;
+
+        for ($attempt = 1; $attempt <= $maxRetries; ++$attempt) {
+            try {
+                if ($persistent && $persistentId !== null) {
+                    $connected = $redis->pconnect($host, $port, $timeout, $persistentId);
+                } else {
+                    $connected = $redis->connect($host, $port, $timeout);
+                }
+
+                if ($connected) {
+                    break;
+                }
+            } catch (Exception $e) {
+                $lastException = $e;
+                if ($attempt < $maxRetries) {
+                    usleep(100000 * $attempt); // Progressive backoff
+                }
+            }
+        }
+
+        if (!$connected) {
+            throw new RuntimeException(
+                sprintf('Failed to connect to Redis at %s:%d after %d attempts', $host, $port, $maxRetries),
+                0,
+                $lastException
+            );
+        }
+
+        // Authenticate if needed
+        if ($password !== null && $password !== '') {
+            if (!$redis->auth($password)) {
+                throw new RuntimeException('Redis authentication failed');
+            }
+        }
+
+        // Select database
+        if ($database > 0) {
+            if (!$redis->select($database)) {
+                throw new RuntimeException(sprintf('Failed to select Redis database %d', $database));
+            }
+        }
+
+        return new RedisStore($redis);
+    }
+
+    public function createPdoStore(): PdoStore
+    {
+        $dsn = $this->lockConfig['pdo']['dsn'] ?? 'mysql:host=localhost;dbname=test';
+        $username = $this->lockConfig['pdo']['username'] ?? 'root';
+        $password = $this->lockConfig['pdo']['password'] ?? '';
+
+        return new PdoStore($dsn, ['db_username' => $username, 'db_password' => $password]);
+    }
+
+    public function createMemcachedStore(): MemcachedStore
+    {
+        $memcached = new Memcached();
+        $servers = $this->lockConfig['memcached']['servers'] ?? [['']];
+        foreach ($servers as $server) {
+            if (is_array($server) && count($server) >= 2) {
+                $memcached->addServer($server[0], $server[1]);
+            } else {
+                throw new InvalidArgumentException('Invalid Memcached server configuration');
+            }
+        }
+
+        return new MemcachedStore($memcached);
+    }
+
+    public function createFlockStore(): FlockStore
+    {
+        // Default file store uses system temp directory
+        $filePath = $this->tempDir . DIRECTORY_SEPARATOR . 'lock_' . $this->id . '.lock';
+
+        // Ensure the directory exists
+        if (!is_dir($this->tempDir) && !mkdir($this->tempDir, 0o777, true) && !is_dir($this->tempDir)) {
+            throw new RuntimeException(sprintf('Failed to create temp directory: %s', $this->tempDir));
+        }
+
+        return new FlockStore($filePath);
     }
 
     /**
@@ -253,36 +556,22 @@ class Job
      * being executed if the previous is still running.
      * The job id is used as a filename for the lock file.
      *
-     * @param  string    $tempDir          The directory path for the lock files
-     * @param  callable|null  $whenOverlapping  A callback to ignore job overlapping
+     * @param string        $tempDir         The directory path for the lock files
+     * @param callable|null $whenOverlapping A callback to ignore job overlapping
+     *
      * @return self
      */
-    public function onlyOne($tempDir = null, ?callable $whenOverlapping = null)
+    public function onlyOne(?string $tempDir = null, ?callable $whenOverlapping = null): self
     {
-        if ($tempDir === null || ! is_dir($tempDir)) {
-            $tempDir = $this->tempDir;
+        $this->lockable = true;
+
+        if ($whenOverlapping !== null) {
+            $this->whenOverlapping = $whenOverlapping;
         }
 
-         if(file_exists('/dev/null')){
-             //linux systems
-             $this->lockFile = implode('/', [
-                 trim($tempDir),
-                 trim($this->id) . '.lock',
-             ]);
-         }else{
-             //windows systems need back slashes for file paths
-             $this->lockFile = implode('\\', [
-                 trim(str_replace('/', '\\', $tempDir)),
-                 trim($this->id) . '.lock',
-             ]);
-         }
-
-        if ($whenOverlapping) {
-            $this->whenOverlapping = $whenOverlapping;
-        } else {
-            $this->whenOverlapping = function () {
-                return false;
-            };
+        // Legacy support for tempDir parameter
+        if ($tempDir !== null && is_dir($tempDir)) {
+            $this->tempDir = $tempDir;
         }
 
         return $this;
@@ -312,15 +601,15 @@ class Job
 
         // Add the boilerplate to redirect the output to file/s
         if (count($this->outputTo) > 0) {
-            if(file_exists('/dev/null')){
-                //linux systems
-                 $compiled .= ' | tee ';
-                 $compiled .= $this->outputMode === 'a' ? '-a ' : '';
-             }else{
-                //windows systems
-                 $compiled .= ' ';
-                 $compiled .= $this->outputMode === 'a' ? '>> ' : '> ';
-             }
+            if (file_exists('/dev/null')) {
+                // linux systems
+                $compiled .= ' | tee ';
+                $compiled .= $this->outputMode === 'a' ? '-a ' : '';
+            } else {
+                // windows systems
+                $compiled .= ' ';
+                $compiled .= $this->outputMode === 'a' ? '>> ' : '> ';
+            }
             foreach ($this->outputTo as $file) {
                 $compiled .= $file . ' ';
             }
@@ -330,11 +619,11 @@ class Job
 
         // Add boilerplate to remove lockfile after execution
         if ($this->lockFile) {
-           if(file_exists('/dev/null')){
-                //linux systems
+            if (file_exists('/dev/null')) {
+                // linux systems
                 $compiled .= '; rm ' . $this->lockFile;
-            }else{
-                //windows systems
+            } else {
+                // windows systems
                 $compiled .= ' & del ' . $this->lockFile;
             }
         }
@@ -343,11 +632,11 @@ class Job
         if ($this->canRunInBackground()) {
             // Parentheses are need execute the chain of commands in a subshell
             // that can then run in background
-            if(file_exists('/dev/null')){
-                //linux systems
+            if (file_exists('/dev/null')) {
+                // linux systems
                 $compiled = '(' . $compiled . ') > /dev/null 2>&1 &';
-            }else{
-                //windows systems
+            } else {
+                // windows systems
                 $compiled = '(' . $compiled . ') > NUL 2>&1';
             }
         }
@@ -356,32 +645,10 @@ class Job
     }
 
     /**
-     * Configure the job.
-     *
-     * @param  array  $config
-     * @return self
-     */
-    public function configure(array $config = [])
-    {
-        if (isset($config['email'])) {
-            if (! is_array($config['email'])) {
-                throw new InvalidArgumentException('Email configuration should be an array.');
-            }
-            $this->emailConfig = $config['email'];
-        }
-
-        // Check if config has defined a tempDir
-        if (isset($config['tempDir']) && is_dir($config['tempDir'])) {
-            $this->tempDir = $config['tempDir'];
-        }
-
-        return $this;
-    }
-
-    /**
      * Truth test to define if the job should run if due.
      *
-     * @param  callable  $fn
+     * @param callable $fn
+     *
      * @return self
      */
     public function when(callable $fn)
@@ -404,14 +671,11 @@ class Job
         }
 
         // If overlapping, don't run
-        if ($this->isOverlapping()) {
+        if ($this->lockable && !$this->createLock()) {
             return false;
         }
 
         $compiled = $this->compile();
-
-        // Write lock file if necessary
-        $this->createLockFile();
 
         if (is_callable($this->before)) {
             call_user_func($this->before);
@@ -425,23 +689,36 @@ class Job
 
         $this->finalise();
 
+        $this->removeLock();
+
         return true;
     }
 
     /**
      * Create the job lock file.
      *
-     * @param  mixed  $content
      * @return void
      */
-    private function createLockFile($content = null)
+    private function createLock(): bool
     {
-        if ($this->lockFile) {
-            if ($content === null || ! is_string($content)) {
-                $content = $this->getId();
+        try {
+            $factory = $this->getLockFactory();
+
+            $lockId = new Key($this->getLockId());
+
+            $this->lock = $factory->createLockFromKey($lockId, 300, true); // TTL de 5 minutos
+
+            if (!$this->lock->acquire()) {
+                error_log("Job '{$this->id}' is locked by another process.");
+
+                return false;
             }
 
-            file_put_contents($this->lockFile, $content);
+            return true;
+        } catch (Exception $e) {
+            error_log('Error creating lock: ' . $e->getMessage());
+
+            return false;
         }
     }
 
@@ -450,19 +727,21 @@ class Job
      *
      * @return void
      */
-    private function removeLockFile()
+    private function removeLock(): void
     {
-        if ($this->lockFile && file_exists($this->lockFile)) {
-            unlink($this->lockFile);
+        if ($this->lock instanceof LockInterface && $this->lock->isAcquired()) {
+            $this->lock->release();
         }
     }
 
     /**
      * Execute a callable job.
      *
-     * @param  callable  $fn
-     * @throws Exception
+     * @param callable $fn
+     *
      * @return string
+     *
+     * @throws Exception
      */
     private function exec(callable $fn)
     {
@@ -472,6 +751,7 @@ class Job
             $returnData = call_user_func_array($fn, $this->args);
         } catch (Exception $e) {
             ob_end_clean();
+
             throw $e;
         }
 
@@ -487,16 +767,15 @@ class Job
             }
         }
 
-        $this->removeLockFile();
-
         return $outputBuffer . (is_string($returnData) ? $returnData : '');
     }
 
     /**
      * Set the file/s where to write the output of the job.
      *
-     * @param  string|array  $filename
-     * @param  bool          $append
+     * @param string|array $filename
+     * @param bool         $append
+     *
      * @return self
      */
     public function output($filename, $append = false)
@@ -522,12 +801,13 @@ class Job
      * The Job should be set to write output to a file
      * for this to work.
      *
-     * @param  string|array  $email
+     * @param string|array $email
+     *
      * @return self
      */
     public function email($email)
     {
-        if (! is_string($email) && ! is_array($email)) {
+        if (!is_string($email) && !is_array($email)) {
             throw new InvalidArgumentException('The email can be only string or array');
         }
 
@@ -544,7 +824,7 @@ class Job
      *
      * @return void
      */
-    private function finalise()
+    private function finalise(): void
     {
         // Send output to email
         $this->emailOutput();
@@ -562,13 +842,13 @@ class Job
      */
     private function emailOutput()
     {
-        if (! count($this->outputTo) || ! count($this->emailTo)) {
+        if (!count($this->outputTo) || !count($this->emailTo)) {
             return false;
         }
 
-        if (isset($this->emailConfig['ignore_empty_output']) &&
-            $this->emailConfig['ignore_empty_output'] === true &&
-            empty($this->output)
+        if (isset($this->emailConfig['ignore_empty_output'])
+            && $this->emailConfig['ignore_empty_output'] === true
+            && empty($this->output)
         ) {
             return false;
         }
@@ -583,6 +863,7 @@ class Job
      * Job object is injected as a parameter to callable function.
      *
      * @param callable $fn
+     *
      * @return self
      */
     public function before(callable $fn)
@@ -600,8 +881,9 @@ class Job
      * second parameter. The job will run in background if it
      * meets all the other criteria.
      *
-     * @param  callable  $fn
-     * @param  bool      $runInBackground
+     * @param callable $fn
+     * @param bool     $runInBackground
+     *
      * @return self
      */
     public function then(callable $fn, $runInBackground = false)
