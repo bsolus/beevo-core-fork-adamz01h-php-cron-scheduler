@@ -7,9 +7,20 @@ namespace GO;
 use DateTime;
 use Exception;
 use InvalidArgumentException;
+use Redis;
+use RuntimeException;
+use Symfony\Component\Lock\BlockingStoreInterface;
+use Symfony\Component\Lock\LockFactory;
+use Symfony\Component\Lock\LockInterface;
+use Symfony\Component\Lock\PersistingStoreInterface;
+use Symfony\Component\Lock\SharedLockStoreInterface;
+use Symfony\Component\Lock\Store\FlockStore;
+use Symfony\Component\Lock\Store\PdoStore;
+use Symfony\Component\Lock\Store\RedisStore;
+use Symfony\Component\Lock\Store\SemaphoreStore;
 
 /**
- * Job Scheduler with centralized configuration.
+ * Job Scheduler with centralized configuration and lock management.
  *
  * @author  Your Name
  * @license MIT
@@ -57,7 +68,6 @@ class Scheduler
      *     ignore_empty_output?: bool
      *   },
      *   lock?: array{
-     *     enabled?: bool,
      *     adapter?: string,
      *     prefix?: string,
      *     ttl?: int,
@@ -78,11 +88,6 @@ class Scheduler
      *       password?: string|null,
      *       table?: string,
      *       options?: array<string, mixed>
-     *     },
-     *     memcached?: array{
-     *       host?: string,
-     *       port?: int,
-     *       options?: array<int, mixed>
      *     },
      *     file?: array{
      *       directory?: string|null
@@ -108,7 +113,7 @@ class Scheduler
             'ignore_empty_output' => true,
         ],
         'lock' => [
-            'adapter'      => 'file',
+            'adapter'      => 'flock',
             'prefix'       => 'cron_lock_',
             'ttl'          => 300,
             'auto_release' => true,
@@ -129,17 +134,26 @@ class Scheduler
                 'table'    => 'lock_keys',
                 'options'  => [],
             ],
-            'memcached' => [
-                'host'    => '127.0.0.1',
-                'port'    => 11211,
-                'options' => [],
-            ],
             'file' => [
                 'directory' => null,
             ],
             'semaphore' => [],
         ],
     ];
+
+    /**
+     * Static lock factory instance (shared across scheduler instances).
+     *
+     * @var LockFactory|null
+     */
+    private static ?LockFactory $lockFactory = null;
+
+    /**
+     * Static lock store instance (shared across scheduler instances).
+     *
+     * @var SharedLockStoreInterface|PersistingStoreInterface|BlockingStoreInterface|null
+     */
+    private static SharedLockStoreInterface|PersistingStoreInterface|BlockingStoreInterface|null $lockStore = null;
 
     /**
      * Create new Scheduler instance.
@@ -155,6 +169,11 @@ class Scheduler
         // Set default tempDir if not provided
         if (empty($this->config['tempDir'])) {
             $this->config['tempDir'] = sys_get_temp_dir();
+        }
+
+        // Initialize lock factory if locking is enabled
+        if (!empty($this->config['lock']['enabled'])) {
+            $this->initializeLockFactory();
         }
     }
 
@@ -180,8 +199,8 @@ class Scheduler
     private function validateConfig(): void
     {
         if (isset($this->config['lock']['enabled']) && $this->config['lock']['enabled']) {
-            $adapter = $this->config['lock']['adapter'] ?? 'file';
-            $validAdapters = ['file', 'redis', 'pdo', 'memcached', 'semaphore'];
+            $adapter = $this->config['lock']['adapter'] ?? 'flock';
+            $validAdapters = ['flock', 'redis', 'pdo', 'semaphore'];
 
             if (!in_array($adapter, $validAdapters, true)) {
                 throw new InvalidArgumentException(
@@ -204,13 +223,6 @@ class Scheduler
                     }
 
                     break;
-
-                case 'memcached':
-                    if (empty($this->config['lock']['memcached']['host'])) {
-                        throw new InvalidArgumentException('Memcached host is required for Memcached lock adapter');
-                    }
-
-                    break;
             }
         }
 
@@ -220,6 +232,185 @@ class Scheduler
                 throw new InvalidArgumentException('Lock TTL must be a positive integer');
             }
         }
+
+        // Validate temp directory
+        if (isset($this->config['tempDir']) && !is_dir($this->config['tempDir'])) {
+            throw new InvalidArgumentException(
+                sprintf('Temp directory "%s" does not exist', $this->config['tempDir'])
+            );
+        }
+    }
+
+    /**
+     * Initialize the lock factory.
+     *
+     * @return void
+     *
+     * @throws RuntimeException If lock store cannot be created
+     */
+    private function initializeLockFactory(): void
+    {
+        if (self::$lockFactory === null || self::$lockStore === null) {
+            self::$lockStore = $this->createLockStore();
+            self::$lockFactory = new LockFactory(self::$lockStore);
+        }
+    }
+
+    /**
+     * Create the appropriate lock store based on configuration.
+     *
+     * @return SharedLockStoreInterface|PersistingStoreInterface|BlockingStoreInterface
+     *
+     * @throws RuntimeException If store cannot be created
+     */
+    private function createLockStore(): SharedLockStoreInterface|PersistingStoreInterface|BlockingStoreInterface
+    {
+        $adapter = $this->config['lock']['adapter'] ?? 'flock';
+
+        try {
+            switch ($adapter) {
+                case 'redis':
+                    return $this->createRedisStore();
+
+                case 'pdo':
+                    return $this->createPdoStore();
+
+                case 'semaphore':
+                    return new SemaphoreStore();
+
+                case 'flock':
+                default:
+                    return $this->createFlockStore();
+            }
+        } catch (Exception $e) {
+            throw new RuntimeException(
+                sprintf('Failed to create %s lock store: %s', $adapter, $e->getMessage()),
+                0,
+                $e
+            );
+        }
+    }
+
+    /**
+     * Create Redis lock store.
+     *
+     * @return RedisStore
+     *
+     * @throws RuntimeException If Redis connection fails
+     */
+    private function createRedisStore(): RedisStore
+    {
+        $config = $this->config['lock']['redis'] ?? [];
+
+        $host = $config['host'] ?? '127.0.0.1';
+        $port = (int) ($config['port'] ?? 6379);
+        $timeout = (float) ($config['timeout'] ?? 5.0);
+        $password = $config['password'] ?? null;
+        $database = (int) ($config['database'] ?? 0);
+        $persistent = (bool) ($config['persistent'] ?? false);
+        $persistentId = $config['persistent_id'] ?? null;
+
+        $redis = new Redis();
+
+        // Connect with retry logic
+        $maxRetries = 3;
+        $connected = false;
+        $lastException = null;
+
+        for ($attempt = 1; $attempt <= $maxRetries; ++$attempt) {
+            try {
+                if ($persistent && $persistentId !== null) {
+                    $connected = $redis->pconnect($host, $port, $timeout, $persistentId);
+                } else {
+                    $connected = $redis->connect($host, $port, $timeout);
+                }
+
+                if ($connected) {
+                    break;
+                }
+            } catch (Exception $e) {
+                $lastException = $e;
+                if ($attempt < $maxRetries) {
+                    usleep(100000 * $attempt); // Progressive backoff
+                }
+            }
+        }
+
+        if (!$connected) {
+            throw new RuntimeException(
+                sprintf('Failed to connect to Redis at %s:%d after %d attempts', $host, $port, $maxRetries),
+                0,
+                $lastException
+            );
+        }
+
+        // Authenticate if needed
+        if ($password !== null && $password !== '') {
+            if (!$redis->auth($password)) {
+                throw new RuntimeException('Redis authentication failed');
+            }
+        }
+
+        // Select database
+        if ($database > 0) {
+            if (!$redis->select($database)) {
+                throw new RuntimeException(sprintf('Failed to select Redis database %d', $database));
+            }
+        }
+
+        return new RedisStore($redis);
+    }
+
+    /**
+     * Create PDO lock store.
+     *
+     * @return PdoStore
+     *
+     * @throws RuntimeException If PDO connection fails
+     */
+    private function createPdoStore(): PdoStore
+    {
+        $config = $this->config['lock']['pdo'] ?? [];
+
+        $dsn = $config['dsn'] ?? 'mysql:host=localhost;dbname=test';
+        $username = $config['username'] ?? 'root';
+        $password = $config['password'] ?? '';
+        $options = $config['options'] ?? [];
+
+        try {
+            return new PdoStore($dsn, [
+                'db_username' => $username,
+                'db_password' => $password,
+            ] + $options);
+        } catch (Exception $e) {
+            throw new RuntimeException(
+                sprintf('Failed to create PDO connection: %s', $e->getMessage()),
+                0,
+                $e
+            );
+        }
+    }
+
+    /**
+     * Create file-based (flock) lock store.
+     *
+     * @return FlockStore
+     *
+     * @throws RuntimeException If directory creation fails
+     */
+    private function createFlockStore(): FlockStore
+    {
+        $directory = $this->config['lock']['file']['directory'] ?? $this->config['tempDir'];
+
+        // Ensure the directory exists
+        if (!is_dir($directory) && !mkdir($directory, 0o777, true) && !is_dir($directory)) {
+            throw new RuntimeException(sprintf('Failed to create lock directory: %s', $directory));
+        }
+
+        // Use a single lock file for all jobs (can be customized per job)
+        $filePath = rtrim($directory, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'scheduler.lock';
+
+        return new FlockStore($filePath);
     }
 
     /**
@@ -230,6 +421,73 @@ class Scheduler
     public function getConfig(): array
     {
         return $this->config;
+    }
+
+    /**
+     * Create a lock for a specific job ID.
+     *
+     * @param string   $jobId The job identifier
+     * @param int|null $ttl   Optional TTL override
+     *
+     * @return LockInterface
+     *
+     * @throws RuntimeException If lock cannot be created
+     */
+    public function createLock(string $jobId, ?int $ttl = null): LockInterface
+    {
+        if (self::$lockFactory === null) {
+            $this->initializeLockFactory();
+        }
+
+        $lockId = $this->getLockId($jobId);
+        $lockTtl = $ttl ?? $this->config['lock']['ttl'] ?? 300;
+        $autoRelease = $this->config['lock']['auto_release'] ?? true;
+
+        return self::$lockFactory->createLock($lockId, $lockTtl, $autoRelease);
+    }
+
+    /**
+     * Check if a job is currently locked.
+     *
+     * @param string $jobId The job identifier
+     *
+     * @return bool True if locked, false otherwise
+     */
+    public function isJobLocked(string $jobId): bool
+    {
+        if (empty($this->config['lock']['enabled'])) {
+            return false;
+        }
+
+        try {
+            $testLock = $this->createLock($jobId, 1); // Very short TTL for testing
+
+            if ($testLock->acquire(false)) {
+                $testLock->release();
+
+                return false;
+            }
+
+            return true;
+        } catch (Exception $e) {
+            error_log(sprintf('Failed to check lock status for job %s: %s', $jobId, $e->getMessage()));
+
+            return false;
+        }
+    }
+
+    /**
+     * Get lock ID for a job.
+     *
+     * @param string $jobId The job identifier
+     *
+     * @return string
+     */
+    private function getLockId(string $jobId): string
+    {
+        $prefix = $this->config['lock']['prefix'] ?? 'cron_lock_';
+
+        return $prefix . $jobId;
     }
 
     /**
@@ -272,7 +530,7 @@ class Scheduler
      *
      * @return array<int, Job>
      */
-    public function getQueuedJobs(DateTime|string|null $date = null): array
+    public function getQueuedJobs($date = null): array
     {
         if ($date === null) {
             return $this->prioritiseJobs();
@@ -293,16 +551,16 @@ class Scheduler
     /**
      * Queue a function execution.
      *
-     * @param callable     $fn   The function to execute
-     * @param array<mixed> $args Optional arguments to pass to the function
-     * @param string|null  $id   Optional custom identifier
+     * @param callable             $fn   The function to execute
+     * @param array<string, mixed> $args Optional arguments to pass to the function
+     * @param string|null          $id   Optional custom identifier
      *
      * @return Job
      */
     public function call(callable $fn, array $args = [], ?string $id = null): Job
     {
         $job = new Job($fn, $args, $id);
-        $job->configure($this->config);
+        $job->configure($this->config, $this);
         $this->queueJob($job);
 
         return $job;
@@ -317,6 +575,8 @@ class Scheduler
      * @param string|null          $id     Optional custom identifier
      *
      * @return Job
+     *
+     * @throws InvalidArgumentException If script is invalid
      */
     public function php(string $script, ?string $bin = null, array $args = [], ?string $id = null): Job
     {
@@ -343,7 +603,7 @@ class Scheduler
 
         $command = sprintf('%s %s', $phpBinary, $script);
         $job = new Job($command, $args, $id);
-        $job->configure($this->config);
+        $job->configure($this->config, $this);
         $this->queueJob($job);
 
         return $job;
@@ -357,6 +617,8 @@ class Scheduler
      * @param string|null          $id      Optional custom identifier
      *
      * @return Job
+     *
+     * @throws InvalidArgumentException If command is empty
      */
     public function raw(string $command, array $args = [], ?string $id = null): Job
     {
@@ -365,7 +627,7 @@ class Scheduler
         }
 
         $job = new Job($command, $args, $id);
-        $job->configure($this->config);
+        $job->configure($this->config, $this);
         $this->queueJob($job);
 
         return $job;
@@ -441,7 +703,7 @@ class Scheduler
         $this->executedJobs[] = $job;
 
         $compiled = $job->compile();
-        $message = is_callable($compiled) ? 'Closure' : $compiled;
+        $message = is_callable($compiled) ? 'Closure' : (string) $compiled;
 
         $this->addSchedulerVerboseOutput(
             sprintf('Executing job [%s]: %s', $job->getId(), $message)
@@ -471,7 +733,7 @@ class Scheduler
         $this->failedJobs[] = new FailedJob($job, $e);
 
         $compiled = $job->compile();
-        $message = is_callable($compiled) ? 'Closure' : $compiled;
+        $message = is_callable($compiled) ? 'Closure' : (string) $compiled;
 
         $this->addSchedulerVerboseOutput(
             sprintf('Failed job [%s]: %s - Error: %s', $job->getId(), $message, $e->getMessage())
@@ -497,7 +759,7 @@ class Scheduler
      *
      * @throws InvalidArgumentException If invalid output type
      */
-    public function getVerboseOutput(string $type = 'text'): array|string
+    public function getVerboseOutput(string $type = 'text')
     {
         switch ($type) {
             case 'text':
@@ -534,6 +796,8 @@ class Scheduler
      * @param array<int, int> $seconds Seconds when the scheduler should run (0-59)
      *
      * @return void
+     *
+     * @throws InvalidArgumentException If invalid second values
      */
     public function work(array $seconds = [0]): void
     {

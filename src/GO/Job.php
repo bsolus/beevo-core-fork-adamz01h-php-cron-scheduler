@@ -8,32 +8,13 @@ use Cron\CronExpression;
 use DateTime;
 use Exception;
 use InvalidArgumentException;
-use Memcached;
-use Redis;
-use RuntimeException;
-use Symfony\Component\Lock\BlockingStoreInterface;
-use Symfony\Component\Lock\Key;
-use Symfony\Component\Lock\LockFactory;
 use Symfony\Component\Lock\LockInterface;
-use Symfony\Component\Lock\PersistingStoreInterface;
-use Symfony\Component\Lock\SharedLockStoreInterface;
-use Symfony\Component\Lock\Store\FlockStore;
-use Symfony\Component\Lock\Store\MemcachedStore;
-use Symfony\Component\Lock\Store\PdoStore;
-use Symfony\Component\Lock\Store\RedisStore;
-use Symfony\Component\Lock\Store\SemaphoreStore;
 
 /**
- * Job class for scheduling and executing tasks with locking mechanism.
- *
- * This class provides functionality to create, schedule, and execute jobs
- * with various features like overlap prevention, output handling, and email notifications.
+ * Represents a scheduled job with execution logic and configuration.
  *
  * @author  Your Name
- *
- * @version 1.0.0
- *
- * @since   1.0.0
+ * @license MIT
  */
 class Job
 {
@@ -48,7 +29,7 @@ class Job
     private string $id;
 
     /**
-     * Command to execute (string, callable, or array).
+     * Command to execute.
      *
      * @var string|callable|array<mixed>
      */
@@ -80,7 +61,7 @@ class Job
      *
      * @var CronExpression|null
      */
-    private ?CronExpression $executionTime;
+    private ?CronExpression $executionTime = null;
 
     /**
      * Job schedule year.
@@ -97,13 +78,6 @@ class Job
     private string $tempDir;
 
     /**
-     * Path to the lock file.
-     *
-     * @var string|null
-     */
-    private ?string $lockFile = null;
-
-    /**
      * This could prevent the job to run.
      * If true, the job will run (if due).
      *
@@ -114,9 +88,9 @@ class Job
     /**
      * The output of the executed job.
      *
-     * @var string|array<string>|null
+     * @var string|array<int, string>|null
      */
-    private string|array|null $output;
+    private string|array $output;
 
     /**
      * The return code of the executed job.
@@ -128,14 +102,14 @@ class Job
     /**
      * Files to write the output of the job.
      *
-     * @var array<string>
+     * @var array<int, string>
      */
     private array $outputTo = [];
 
     /**
      * Email addresses where the output should be sent to.
      *
-     * @var array<string>
+     * @var array<int, string>
      */
     private array $emailTo = [];
 
@@ -169,7 +143,7 @@ class Job
     private $whenOverlapping;
 
     /**
-     * Output mode for file writing ('w' for write, 'a' for append).
+     * Output mode for file writing.
      *
      * @var string
      */
@@ -190,25 +164,11 @@ class Job
     private ?LockInterface $lock = null;
 
     /**
-     * Lock configuration from scheduler.
+     * Reference to the scheduler that manages this job.
      *
-     * @var array<string, mixed>
+     * @var Scheduler|null
      */
-    private array $lockConfig = [];
-
-    /**
-     * Static lock factory instance (shared across jobs).
-     *
-     * @var LockFactory|null
-     */
-    private static ?LockFactory $lockFactory = null;
-
-    /**
-     * Static lock store instance (shared across jobs).
-     *
-     * @var SharedLockStoreInterface|PersistingStoreInterface|BlockingStoreInterface|null
-     */
-    private static SharedLockStoreInterface|PersistingStoreInterface|BlockingStoreInterface|null $lockStore = null;
+    private ?Scheduler $scheduler = null;
 
     /**
      * Create a new Job instance.
@@ -216,8 +176,6 @@ class Job
      * @param string|callable|array<mixed> $command The command or function to execute
      * @param array<string, mixed>         $args    Arguments for the command
      * @param string|null                  $id      Optional job identifier
-     *
-     * @throws InvalidArgumentException When command is invalid
      */
     public function __construct(string|callable|array $command, array $args = [], ?string $id = null)
     {
@@ -239,7 +197,7 @@ class Job
      *
      * @param string|callable|array<mixed> $command The command
      *
-     * @return string The generated unique identifier
+     * @return string
      */
     private function generateId(string|callable|array $command): string
     {
@@ -261,7 +219,7 @@ class Job
     /**
      * Get the Job id.
      *
-     * @return string The job identifier
+     * @return string
      */
     public function getId(): string
     {
@@ -271,14 +229,18 @@ class Job
     /**
      * Configure the job with scheduler settings.
      *
-     * @param array<string, mixed> $config Configuration array
+     * @param array<string, mixed> $config    Configuration array
+     * @param Scheduler|null       $scheduler Reference to the scheduler
      *
      * @return self
-     *
-     * @throws InvalidArgumentException When temp directory doesn't exist
      */
-    public function configure(array $config = []): self
+    public function configure(array $config = [], ?Scheduler $scheduler = null): self
     {
+        // Store scheduler reference
+        if ($scheduler !== null) {
+            $this->scheduler = $scheduler;
+        }
+
         // Configure email settings
         if (isset($config['email']) && is_array($config['email'])) {
             $this->emailConfig = $config['email'];
@@ -294,24 +256,18 @@ class Job
             $this->tempDir = $config['tempDir'];
         }
 
-        // Configure lock settings
-        if (isset($config['lock']) && is_array($config['lock'])) {
-            $this->lockConfig = $config['lock'];
-        }
-
         return $this;
     }
 
     /**
      * Check if the Job is due to run.
-     *
      * It accepts as input a DateTime used to check if
      * the job is due. Defaults to job creation time.
      * It also defaults the execution time if not previously defined.
      *
-     * @param DateTime|null $date Date to check against, defaults to creation time
+     * @param DateTime|null $date Date to check against
      *
-     * @return bool True if job is due to run
+     * @return bool
      */
     public function isDue(?DateTime $date = null): bool
     {
@@ -320,7 +276,7 @@ class Job
             $this->at('* * * * *');
         }
 
-        $date = $date !== null ? $date : $this->creationTime;
+        $date ??= $this->creationTime;
 
         if ($this->executionYear && $this->executionYear !== $date->format('Y')) {
             return false;
@@ -332,229 +288,23 @@ class Job
     /**
      * Check if the Job is overlapping using configured lock adapter.
      *
-     * @return bool True if job is overlapping with another instance
+     * @return bool
      */
     public function isOverlapping(): bool
     {
-        if (!$this->lockable || empty($this->lockConfig['enabled'])) {
+        if (!$this->lockable || !$this->scheduler) {
             return false;
         }
 
         try {
-            $factory = $this->getLockFactory();
-            $lockId = $this->getLockId();
-
-            // Try to acquire a test lock with minimal TTL
-            $testLock = $factory->createLock($lockId, 0.1);
-
-            if ($testLock->acquire(false)) {
-                $testLock->release();
-
-                return false;
-            }
-
-            return true;
+            // Use scheduler to check for overlap
+            return $this->scheduler->isJobLocked($this->id);
         } catch (Exception $e) {
             // Log error but don't fail the check
             error_log(sprintf('Failed to check overlap for job %s: %s', $this->id, $e->getMessage()));
 
             return false;
         }
-    }
-
-    /**
-     * Get lock ID for this job.
-     *
-     * @return string The lock identifier
-     */
-    private function getLockId(): string
-    {
-        $prefix = $this->lockConfig['prefix'] ?? 'cron_lock_';
-
-        return $prefix . $this->id;
-    }
-
-    /**
-     * Get or create the lock factory.
-     *
-     * @return LockFactory The lock factory instance
-     *
-     * @throws RuntimeException If lock store cannot be created
-     */
-    private function getLockFactory(): LockFactory
-    {
-        if (self::$lockFactory === null || self::$lockStore === null) {
-            self::$lockStore = $this->createLockStore();
-            self::$lockFactory = new LockFactory(self::$lockStore);
-        }
-
-        return self::$lockFactory;
-    }
-
-    /**
-     * Create the appropriate lock store based on configuration.
-     *
-     * @return SharedLockStoreInterface|PersistingStoreInterface|BlockingStoreInterface
-     *
-     * @throws RuntimeException If store cannot be created
-     */
-    private function createLockStore(): SharedLockStoreInterface|PersistingStoreInterface|BlockingStoreInterface
-    {
-        $adapter = $this->lockConfig['adapter'] ?? 'flock';
-
-        try {
-            switch ($adapter) {
-                case 'redis':
-                    return $this->createRedisStore();
-
-                case 'pdo':
-                    return $this->createPdoStore();
-
-                case 'memcached':
-                    return $this->createMemcachedStore();
-
-                case 'semaphore':
-                    return new SemaphoreStore();
-
-                case 'flock':
-                default:
-                    return $this->createFlockStore();
-            }
-        } catch (Exception $e) {
-            throw new RuntimeException(
-                sprintf('Failed to create %s lock store: %s', $adapter, $e->getMessage()),
-                0,
-                $e
-            );
-        }
-    }
-
-    /**
-     * Create Redis lock store.
-     *
-     * @return RedisStore The Redis lock store
-     *
-     * @throws RuntimeException If Redis connection fails
-     */
-    private function createRedisStore(): RedisStore
-    {
-        $config = $this->lockConfig['redis'] ?? [];
-
-        $host = $config['host'] ?? '127.0.0.1';
-        $port = (int) ($config['port'] ?? 6379);
-        $timeout = (float) ($config['timeout'] ?? 5.0);
-        $password = $config['password'] ?? null;
-        $database = (int) ($config['database'] ?? 0);
-        $persistent = (bool) ($config['persistent'] ?? false);
-        $persistentId = $config['persistent_id'] ?? null;
-
-        $redis = new Redis();
-
-        // Connect with retry logic
-        $maxRetries = 3;
-        $connected = false;
-        $lastException = null;
-
-        for ($attempt = 1; $attempt <= $maxRetries; ++$attempt) {
-            try {
-                if ($persistent && $persistentId !== null) {
-                    $connected = $redis->pconnect($host, $port, $timeout, $persistentId);
-                } else {
-                    $connected = $redis->connect($host, $port, $timeout);
-                }
-
-                if ($connected) {
-                    break;
-                }
-            } catch (Exception $e) {
-                $lastException = $e;
-                if ($attempt < $maxRetries) {
-                    usleep(100000 * $attempt); // Progressive backoff
-                }
-            }
-        }
-
-        if (!$connected) {
-            throw new RuntimeException(
-                sprintf('Failed to connect to Redis at %s:%d after %d attempts', $host, $port, $maxRetries),
-                0,
-                $lastException
-            );
-        }
-
-        // Authenticate if needed
-        if ($password !== null && $password !== '') {
-            if (!$redis->auth($password)) {
-                throw new RuntimeException('Redis authentication failed');
-            }
-        }
-
-        // Select database
-        if ($database > 0) {
-            if (!$redis->select($database)) {
-                throw new RuntimeException(sprintf('Failed to select Redis database %d', $database));
-            }
-        }
-
-        return new RedisStore($redis);
-    }
-
-    /**
-     * Create PDO lock store.
-     *
-     * @return PdoStore The PDO lock store
-     *
-     * @throws RuntimeException If PDO connection fails
-     */
-    public function createPdoStore(): PdoStore
-    {
-        $dsn = $this->lockConfig['pdo']['dsn'] ?? 'mysql:host=localhost;dbname=test';
-        $username = $this->lockConfig['pdo']['username'] ?? 'root';
-        $password = $this->lockConfig['pdo']['password'] ?? '';
-
-        return new PdoStore($dsn, ['db_username' => $username, 'db_password' => $password]);
-    }
-
-    /**
-     * Create Memcached lock store.
-     *
-     * @return MemcachedStore The Memcached lock store
-     *
-     * @throws InvalidArgumentException If Memcached server configuration is invalid
-     */
-    public function createMemcachedStore(): MemcachedStore
-    {
-        $memcached = new Memcached();
-        $servers = $this->lockConfig['memcached']['servers'] ?? [['127.0.0.1', 11211]];
-        foreach ($servers as $server) {
-            if (is_array($server) && count($server) >= 2) {
-                $memcached->addServer($server[0], $server[1]);
-            } else {
-                throw new InvalidArgumentException('Invalid Memcached server configuration');
-            }
-        }
-
-        return new MemcachedStore($memcached);
-    }
-
-    /**
-     * Create Flock lock store.
-     *
-     * @return FlockStore The Flock lock store
-     *
-     * @throws RuntimeException If temp directory creation fails
-     */
-    public function createFlockStore(): FlockStore
-    {
-        // Default file store uses system temp directory
-        $filePath = $this->tempDir . DIRECTORY_SEPARATOR . 'lock_' . $this->id . '.lock';
-
-        // Ensure the directory exists
-        if (!is_dir($this->tempDir) && !mkdir($this->tempDir, 0o777, true) && !is_dir($this->tempDir)) {
-            throw new RuntimeException(sprintf('Failed to create temp directory: %s', $this->tempDir));
-        }
-
-        return new FlockStore($filePath);
     }
 
     /**
@@ -572,7 +322,7 @@ class Job
     /**
      * Check if the Job can run in background.
      *
-     * @return bool True if job can run in background
+     * @return bool
      */
     public function canRunInBackground(): bool
     {
@@ -585,12 +335,11 @@ class Job
 
     /**
      * This will prevent the Job from overlapping.
-     *
      * It prevents another instance of the same Job of
      * being executed if the previous is still running.
      * The job id is used as a filename for the lock file.
      *
-     * @param string|null   $tempDir         The directory path for the lock files
+     * @param string|null   $tempDir         The directory path for the lock files (legacy support)
      * @param callable|null $whenOverlapping A callback to ignore job overlapping
      *
      * @return self
@@ -612,11 +361,33 @@ class Job
     }
 
     /**
+     * Check if this job should use locking.
+     *
+     * @return bool
+     */
+    public function isLockable(): bool
+    {
+        return $this->lockable;
+    }
+
+    /**
+     * Set the lock instance for this job.
+     *
+     * @param LockInterface $lock The lock instance
+     *
+     * @return void
+     */
+    public function setLock(LockInterface $lock): void
+    {
+        $this->lock = $lock;
+    }
+
+    /**
      * Compile the Job command.
      *
-     * @return string|callable The compiled command
+     * @return string|callable
      */
-    public function compile()
+    public function compile(): string|callable
     {
         $compiled = $this->command;
 
@@ -625,11 +396,14 @@ class Job
             return $compiled;
         }
 
+        // Convert to string for shell commands
+        $compiled = (string) $compiled;
+
         // Augment with any supplied arguments
         foreach ($this->args as $key => $value) {
-            $compiled .= ' ' . escapeshellarg($key);
+            $compiled .= ' ' . escapeshellarg((string) $key);
             if ($value !== null) {
-                $compiled .= ' ' . escapeshellarg($value);
+                $compiled .= ' ' . escapeshellarg((string) $value);
             }
         }
 
@@ -651,17 +425,6 @@ class Job
             $compiled = trim($compiled);
         }
 
-        // Add boilerplate to remove lockfile after execution
-        if ($this->lockFile) {
-            if (file_exists('/dev/null')) {
-                // linux systems
-                $compiled .= '; rm ' . $this->lockFile;
-            } else {
-                // windows systems
-                $compiled .= ' & del ' . $this->lockFile;
-            }
-        }
-
         // Add boilerplate to run in background
         if ($this->canRunInBackground()) {
             // Parentheses are need execute the chain of commands in a subshell
@@ -681,13 +444,13 @@ class Job
     /**
      * Truth test to define if the job should run if due.
      *
-     * @param callable $fn The truth test function
+     * @param callable $fn Function that returns boolean
      *
      * @return self
      */
     public function when(callable $fn): self
     {
-        $this->truthTest = $fn();
+        $this->truthTest = (bool) $fn();
 
         return $this;
     }
@@ -695,7 +458,7 @@ class Job
     /**
      * Run the job.
      *
-     * @return bool True if job was executed, false if skipped
+     * @return bool True if job executed successfully, false otherwise
      */
     public function run(): bool
     {
@@ -704,8 +467,12 @@ class Job
             return false;
         }
 
-        // If overlapping, don't run
-        if ($this->lockable && !$this->createLock()) {
+        // If overlapping and no callback to handle it, don't run
+        if ($this->lockable && !$this->acquireLock()) {
+            if ($this->whenOverlapping !== null) {
+                call_user_func($this->whenOverlapping);
+            }
+
             return false;
         }
 
@@ -715,32 +482,38 @@ class Job
             call_user_func($this->before);
         }
 
-        if (is_callable($compiled)) {
-            $this->output = $this->exec($compiled);
-        } else {
-            exec($compiled, $this->output, $this->returnCode);
+        try {
+            if (is_callable($compiled)) {
+                $this->output = $this->exec($compiled);
+            } else {
+                $output = [];
+                exec($compiled, $output, $this->returnCode);
+                $this->output = $output;
+            }
+        } catch (Exception $e) {
+            $this->returnCode = 1;
+            $this->output = ['Error: ' . $e->getMessage()];
+        } finally {
+            $this->finalise();
+            $this->releaseLock();
         }
-
-        $this->finalise();
-
-        $this->removeLock();
 
         return true;
     }
 
     /**
-     * Create the job lock file.
+     * Acquire the job lock.
      *
-     * @return bool True if lock was created successfully
+     * @return bool True if lock acquired or not needed, false if already locked
      */
-    private function createLock(): bool
+    private function acquireLock(): bool
     {
+        if (!$this->lockable || !$this->scheduler) {
+            return true;
+        }
+
         try {
-            $factory = $this->getLockFactory();
-
-            $lockId = new Key($this->getLockId());
-
-            $this->lock = $factory->createLockFromKey($lockId, 300, true); // TTL de 5 minutos
+            $this->lock = $this->scheduler->createLock($this->id);
 
             if (!$this->lock->acquire()) {
                 error_log("Job '{$this->id}' is locked by another process.");
@@ -750,18 +523,18 @@ class Job
 
             return true;
         } catch (Exception $e) {
-            error_log('Error creating lock: ' . $e->getMessage());
+            error_log('Error acquiring lock: ' . $e->getMessage());
 
             return false;
         }
     }
 
     /**
-     * Remove the job lock file.
+     * Release the job lock.
      *
      * @return void
      */
-    private function removeLock(): void
+    private function releaseLock(): void
     {
         if ($this->lock instanceof LockInterface && $this->lock->isAcquired()) {
             $this->lock->release();
@@ -771,9 +544,9 @@ class Job
     /**
      * Execute a callable job.
      *
-     * @param callable $fn The function to execute
+     * @param callable $fn Function to execute
      *
-     * @return string The execution output
+     * @return string Output from the function
      *
      * @throws Exception If execution fails
      */
@@ -791,28 +564,37 @@ class Job
 
         $outputBuffer = ob_get_clean();
 
+        // Write to output files if specified
         foreach ($this->outputTo as $filename) {
-            if ($outputBuffer) {
+            if ($outputBuffer !== false && $outputBuffer !== '') {
                 file_put_contents($filename, $outputBuffer, $this->outputMode === 'a' ? FILE_APPEND : 0);
             }
 
-            if ($returnData) {
+            if ($returnData && is_string($returnData)) {
                 file_put_contents($filename, $returnData, FILE_APPEND);
             }
         }
 
-        return $outputBuffer . (is_string($returnData) ? $returnData : '');
+        $result = '';
+        if ($outputBuffer !== false) {
+            $result .= $outputBuffer;
+        }
+        if (is_string($returnData)) {
+            $result .= $returnData;
+        }
+
+        return $result;
     }
 
     /**
      * Set the file/s where to write the output of the job.
      *
-     * @param string|array<string> $filename Single filename or array of filenames
-     * @param bool                 $append   Whether to append to file or overwrite
+     * @param string|array<int, string> $filename File path(s) to write output
+     * @param bool                      $append   Whether to append to existing files
      *
      * @return self
      */
-    public function output(string $filename, bool $append = false): self
+    public function output(string|array $filename, bool $append = false): self
     {
         $this->outputTo = is_array($filename) ? $filename : [$filename];
         $this->outputMode = $append === false ? 'w' : 'a';
@@ -823,26 +605,33 @@ class Job
     /**
      * Get the job output.
      *
-     * @return string|array<string>|null The job output
+     * @return string|array<int, string>|null
      */
-    public function getOutput(): array|string|null
+    public function getOutput(): string|array
     {
         return $this->output;
     }
 
     /**
-     * Set the emails where the output should be sent to.
+     * Get the job return code.
      *
+     * @return int
+     */
+    public function getReturnCode(): int
+    {
+        return $this->returnCode;
+    }
+
+    /**
+     * Set the emails where the output should be sent to.
      * The Job should be set to write output to a file
      * for this to work.
      *
-     * @param string|array<string> $email Single email or array of emails
+     * @param string|array<int, string> $email Email address(es)
      *
      * @return self
-     *
-     * @throws InvalidArgumentException If email parameter is invalid
      */
-    public function email(string $email): self
+    public function email(string|array $email): self
     {
         if (!is_string($email) && !is_array($email)) {
             throw new InvalidArgumentException('The email can be only string or array');
@@ -897,11 +686,10 @@ class Job
     }
 
     /**
-     * Set function to be called before job execution.
-     *
+     * Set function to be called before job execution
      * Job object is injected as a parameter to callable function.
      *
-     * @param callable $fn The function to call before execution
+     * @param callable $fn Function to call before execution
      *
      * @return self
      */
@@ -914,14 +702,13 @@ class Job
 
     /**
      * Set a function to be called after job execution.
-     *
      * By default this will force the job to run in foreground
      * because the output is injected as a parameter of this
      * function, but it could be avoided by passing true as a
      * second parameter. The job will run in background if it
      * meets all the other criteria.
      *
-     * @param callable $fn              The function to call after execution
+     * @param callable $fn              Function to call after execution
      * @param bool     $runInBackground Whether to allow background execution
      *
      * @return self
