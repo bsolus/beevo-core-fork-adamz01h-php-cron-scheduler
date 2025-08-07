@@ -4,10 +4,18 @@ declare(strict_types=1);
 
 namespace GO;
 
+use Cron\CronExpression;
 use DateTime;
 use Exception;
 use InvalidArgumentException;
+use Symfony\Component\Lock\LockInterface;
 
+/**
+ * Represents a scheduled job with execution logic and configuration.
+ *
+ * @author  Your Name
+ * @license MIT
+ */
 class Job
 {
     use Traits\Interval;
@@ -18,64 +26,56 @@ class Job
      *
      * @var string
      */
-    private $id;
+    private string $id;
 
     /**
      * Command to execute.
      *
-     * @var mixed
+     * @var string|callable|array<mixed>
      */
     private $command;
 
     /**
      * Arguments to be passed to the command.
      *
-     * @var array
+     * @var array<string, mixed>
      */
-    private $args = [];
+    private array $args = [];
 
     /**
      * Defines if the job should run in background.
      *
      * @var bool
      */
-    private $runInBackground = true;
+    private bool $runInBackground = true;
 
     /**
      * Creation time.
      *
      * @var DateTime
      */
-    private $creationTime;
+    private DateTime $creationTime;
 
     /**
      * Job schedule time.
      *
-     * @var Cron\CronExpression
+     * @var CronExpression|null
      */
-    private $executionTime;
+    private ?CronExpression $executionTime = null;
 
     /**
      * Job schedule year.
      *
-     * @var string
+     * @var string|null
      */
-    private $executionYear;
+    private ?string $executionYear = null;
 
     /**
-     * Temporary directory path for
-     * lock files to prevent overlapping.
+     * Temporary directory path for lock files to prevent overlapping.
      *
      * @var string
      */
-    private $tempDir;
-
-    /**
-     * Path to the lock file.
-     *
-     * @var string
-     */
-    private $lockFile;
+    private string $tempDir;
 
     /**
      * This could prevent the job to run.
@@ -83,54 +83,54 @@ class Job
      *
      * @var bool
      */
-    private $truthTest = true;
+    private bool $truthTest = true;
 
     /**
      * The output of the executed job.
      *
-     * @var mixed
+     * @var string|array<int, string>|null
      */
-    private $output;
+    private string|array $output;
 
     /**
      * The return code of the executed job.
      *
      * @var int
      */
-    private $returnCode = 0;
+    private int $returnCode = 0;
 
     /**
      * Files to write the output of the job.
      *
-     * @var array
+     * @var array<int, string>
      */
-    private $outputTo = [];
+    private array $outputTo = [];
 
     /**
      * Email addresses where the output should be sent to.
      *
-     * @var array
+     * @var array<int, string>
      */
-    private $emailTo = [];
+    private array $emailTo = [];
 
     /**
      * Configuration for email sending.
      *
-     * @var array
+     * @var array<string, mixed>
      */
-    private $emailConfig = [];
+    private array $emailConfig = [];
 
     /**
      * A function to execute before the job is executed.
      *
-     * @var callable
+     * @var callable|null
      */
     private $before;
 
     /**
      * A function to execute after the job is executed.
      *
-     * @var callable
+     * @var callable|null
      */
     private $after;
 
@@ -138,44 +138,82 @@ class Job
      * A function to ignore an overlapping job.
      * If true, the job will run also if it's overlapping.
      *
-     * @var callable
+     * @var callable|null
      */
     private $whenOverlapping;
 
     /**
+     * Output mode for file writing.
+     *
      * @var string
      */
-    private $outputMode;
+    private string $outputMode = 'w';
+
+    /**
+     * Whether this job should use locking.
+     *
+     * @var bool
+     */
+    private bool $lockable = false;
+
+    /**
+     * The Symfony Lock instance.
+     *
+     * @var LockInterface|null
+     */
+    private ?LockInterface $lock = null;
+
+    /**
+     * Reference to the scheduler that manages this job.
+     *
+     * @var Scheduler|null
+     */
+    private ?Scheduler $scheduler = null;
 
     /**
      * Create a new Job instance.
      *
-     * @param string|callable $command
-     * @param array           $args
-     * @param string          $id
+     * @param string|callable|array<mixed> $command The command or function to execute
+     * @param array<string, mixed>         $args    Arguments for the command
+     * @param string|null                  $id      Optional job identifier
      */
-    public function __construct($command, $args = [], $id = null)
+    public function __construct(string|callable|array $command, array $args = [], ?string $id = null)
     {
-        if (is_string($id)) {
-            $this->id = $id;
-        } else {
-            if (is_string($command)) {
-                $this->id = md5($command);
-            } elseif (is_array($command)) {
-                $this->id = md5(serialize($command));
-            } else {
-                // @var object $command
-                $this->id = spl_object_hash($command);
-            }
-        }
-
-        $this->creationTime = new DateTime('now');
-
-        // initialize the directory path for lock files
-        $this->tempDir = sys_get_temp_dir();
-
         $this->command = $command;
         $this->args = $args;
+        $this->creationTime = new DateTime('now');
+        $this->tempDir = sys_get_temp_dir();
+
+        // Generate ID if not provided
+        if ($id !== null) {
+            $this->id = $id;
+        } else {
+            $this->id = $this->generateId($command);
+        }
+    }
+
+    /**
+     * Generate job ID based on command.
+     *
+     * @param string|callable|array<mixed> $command The command
+     *
+     * @return string
+     */
+    private function generateId(string|callable|array $command): string
+    {
+        if (is_string($command)) {
+            return md5($command);
+        }
+
+        if (is_array($command)) {
+            return md5(serialize($command));
+        }
+
+        if (is_object($command)) {
+            return spl_object_hash($command);
+        }
+
+        return md5(uniqid('job_', true));
     }
 
     /**
@@ -183,9 +221,42 @@ class Job
      *
      * @return string
      */
-    public function getId()
+    public function getId(): string
     {
         return $this->id;
+    }
+
+    /**
+     * Configure the job with scheduler settings.
+     *
+     * @param array<string, mixed> $config    Configuration array
+     * @param Scheduler|null       $scheduler Reference to the scheduler
+     *
+     * @return self
+     */
+    public function configure(array $config = [], ?Scheduler $scheduler = null): self
+    {
+        // Store scheduler reference
+        if ($scheduler !== null) {
+            $this->scheduler = $scheduler;
+        }
+
+        // Configure email settings
+        if (isset($config['email']) && is_array($config['email'])) {
+            $this->emailConfig = $config['email'];
+        }
+
+        // Configure temp directory
+        if (isset($config['tempDir']) && is_string($config['tempDir'])) {
+            if (!is_dir($config['tempDir'])) {
+                throw new InvalidArgumentException(
+                    sprintf('Temp directory "%s" does not exist', $config['tempDir'])
+                );
+            }
+            $this->tempDir = $config['tempDir'];
+        }
+
+        return $this;
     }
 
     /**
@@ -194,18 +265,18 @@ class Job
      * the job is due. Defaults to job creation time.
      * It also defaults the execution time if not previously defined.
      *
-     * @param DateTime $date
+     * @param DateTime|null $date Date to check against
      *
      * @return bool
      */
-    public function isDue(?DateTime $date = null)
+    public function isDue(?DateTime $date = null): bool
     {
         // The execution time is being defaulted if not defined
         if (!$this->executionTime) {
             $this->at('* * * * *');
         }
 
-        $date = $date !== null ? $date : $this->creationTime;
+        $date ??= $this->creationTime;
 
         if ($this->executionYear && $this->executionYear !== $date->format('Y')) {
             return false;
@@ -215,15 +286,25 @@ class Job
     }
 
     /**
-     * Check if the Job is overlapping.
+     * Check if the Job is overlapping using configured lock adapter.
      *
      * @return bool
      */
-    public function isOverlapping()
+    public function isOverlapping(): bool
     {
-        return $this->lockFile
-               && file_exists($this->lockFile)
-               && call_user_func($this->whenOverlapping, filemtime($this->lockFile)) === false;
+        if (!$this->lockable || !$this->scheduler) {
+            return false;
+        }
+
+        try {
+            // Use scheduler to check for overlap
+            return $this->scheduler->isJobLocked($this->id);
+        } catch (Exception $e) {
+            // Log error but don't fail the check
+            error_log(sprintf('Failed to check overlap for job %s: %s', $this->id, $e->getMessage()));
+
+            return false;
+        }
     }
 
     /**
@@ -231,7 +312,7 @@ class Job
      *
      * @return self
      */
-    public function inForeground()
+    public function inForeground(): self
     {
         $this->runInBackground = false;
 
@@ -243,7 +324,7 @@ class Job
      *
      * @return bool
      */
-    public function canRunInBackground()
+    public function canRunInBackground(): bool
     {
         if (is_callable($this->command) || $this->runInBackground === false) {
             return false;
@@ -258,46 +339,55 @@ class Job
      * being executed if the previous is still running.
      * The job id is used as a filename for the lock file.
      *
-     * @param string        $tempDir         The directory path for the lock files
+     * @param string|null   $tempDir         The directory path for the lock files (legacy support)
      * @param callable|null $whenOverlapping A callback to ignore job overlapping
      *
      * @return self
      */
-    public function onlyOne($tempDir = null, ?callable $whenOverlapping = null)
+    public function onlyOne(?string $tempDir = null, ?callable $whenOverlapping = null): self
     {
-        if ($tempDir === null || !is_dir($tempDir)) {
-            $tempDir = $this->tempDir;
-        }
+        $this->lockable = true;
 
-        if (file_exists('/dev/null')) {
-            // linux systems
-            $this->lockFile = implode('/', [
-                trim($tempDir),
-                trim($this->id) . '.lock',
-            ]);
-        } else {
-            // windows systems need back slashes for file paths
-            $this->lockFile = implode('\\', [
-                trim(str_replace('/', '\\', $tempDir)),
-                trim($this->id) . '.lock',
-            ]);
-        }
-
-        if ($whenOverlapping) {
+        if ($whenOverlapping !== null) {
             $this->whenOverlapping = $whenOverlapping;
-        } else {
-            $this->whenOverlapping = fn () => false;
+        }
+
+        // Legacy support for tempDir parameter
+        if ($tempDir !== null && is_dir($tempDir)) {
+            $this->tempDir = $tempDir;
         }
 
         return $this;
     }
 
     /**
+     * Check if this job should use locking.
+     *
+     * @return bool
+     */
+    public function isLockable(): bool
+    {
+        return $this->lockable;
+    }
+
+    /**
+     * Set the lock instance for this job.
+     *
+     * @param LockInterface $lock The lock instance
+     *
+     * @return void
+     */
+    public function setLock(LockInterface $lock): void
+    {
+        $this->lock = $lock;
+    }
+
+    /**
      * Compile the Job command.
      *
-     * @return mixed
+     * @return string|callable
      */
-    public function compile()
+    public function compile(): string|callable
     {
         $compiled = $this->command;
 
@@ -306,11 +396,14 @@ class Job
             return $compiled;
         }
 
+        // Convert to string for shell commands
+        $compiled = (string) $compiled;
+
         // Augment with any supplied arguments
         foreach ($this->args as $key => $value) {
-            $compiled .= ' ' . escapeshellarg($key);
+            $compiled .= ' ' . escapeshellarg((string) $key);
             if ($value !== null) {
-                $compiled .= ' ' . escapeshellarg($value);
+                $compiled .= ' ' . escapeshellarg((string) $value);
             }
         }
 
@@ -332,17 +425,6 @@ class Job
             $compiled = trim($compiled);
         }
 
-        // Add boilerplate to remove lockfile after execution
-        if ($this->lockFile) {
-            if (file_exists('/dev/null')) {
-                // linux systems
-                $compiled .= '; rm ' . $this->lockFile;
-            } else {
-                // windows systems
-                $compiled .= ' & del ' . $this->lockFile;
-            }
-        }
-
         // Add boilerplate to run in background
         if ($this->canRunInBackground()) {
             // Parentheses are need execute the chain of commands in a subshell
@@ -360,39 +442,15 @@ class Job
     }
 
     /**
-     * Configure the job.
-     *
-     * @param array $config
-     *
-     * @return self
-     */
-    public function configure(array $config = [])
-    {
-        if (isset($config['email'])) {
-            if (!is_array($config['email'])) {
-                throw new InvalidArgumentException('Email configuration should be an array.');
-            }
-            $this->emailConfig = $config['email'];
-        }
-
-        // Check if config has defined a tempDir
-        if (isset($config['tempDir']) && is_dir($config['tempDir'])) {
-            $this->tempDir = $config['tempDir'];
-        }
-
-        return $this;
-    }
-
-    /**
      * Truth test to define if the job should run if due.
      *
-     * @param callable $fn
+     * @param callable $fn Function that returns boolean
      *
      * @return self
      */
-    public function when(callable $fn)
+    public function when(callable $fn): self
     {
-        $this->truthTest = $fn();
+        $this->truthTest = (bool) $fn();
 
         return $this;
     }
@@ -400,80 +458,99 @@ class Job
     /**
      * Run the job.
      *
-     * @return bool
+     * @return bool True if job executed successfully, false otherwise
      */
-    public function run()
+    public function run(): bool
     {
         // If the truthTest failed, don't run
         if ($this->truthTest !== true) {
             return false;
         }
 
-        // If overlapping, don't run
-        if ($this->isOverlapping()) {
+        // If overlapping and no callback to handle it, don't run
+        if ($this->lockable && !$this->acquireLock()) {
+            if ($this->whenOverlapping !== null) {
+                call_user_func($this->whenOverlapping);
+            }
+
             return false;
         }
 
         $compiled = $this->compile();
 
-        // Write lock file if necessary
-        $this->createLockFile();
-
         if (is_callable($this->before)) {
             call_user_func($this->before);
         }
 
-        if (is_callable($compiled)) {
-            $this->output = $this->exec($compiled);
-        } else {
-            exec($compiled, $this->output, $this->returnCode);
+        try {
+            if (is_callable($compiled)) {
+                $this->output = $this->exec($compiled);
+            } else {
+                $output = [];
+                exec($compiled, $output, $this->returnCode);
+                $this->output = $output;
+            }
+        } catch (Exception $e) {
+            $this->returnCode = 1;
+            $this->output = ['Error: ' . $e->getMessage()];
+        } finally {
+            $this->finalise();
+            $this->releaseLock();
         }
-
-        $this->finalise();
 
         return true;
     }
 
     /**
-     * Create the job lock file.
+     * Acquire the job lock.
      *
-     * @param mixed $content
-     *
-     * @return void
+     * @return bool True if lock acquired or not needed, false if already locked
      */
-    private function createLockFile($content = null): void
+    private function acquireLock(): bool
     {
-        if ($this->lockFile) {
-            if ($content === null || !is_string($content)) {
-                $content = $this->getId();
+        if (!$this->lockable || !$this->scheduler) {
+            return true;
+        }
+
+        try {
+            $this->lock = $this->scheduler->createLock($this->id);
+
+            if (!$this->lock->acquire()) {
+                error_log("Job '{$this->id}' is locked by another process.");
+
+                return false;
             }
 
-            file_put_contents($this->lockFile, $content);
+            return true;
+        } catch (Exception $e) {
+            error_log('Error acquiring lock: ' . $e->getMessage());
+
+            return false;
         }
     }
 
     /**
-     * Remove the job lock file.
+     * Release the job lock.
      *
      * @return void
      */
-    private function removeLockFile(): void
+    private function releaseLock(): void
     {
-        if ($this->lockFile && file_exists($this->lockFile)) {
-            unlink($this->lockFile);
+        if ($this->lock instanceof LockInterface && $this->lock->isAcquired()) {
+            $this->lock->release();
         }
     }
 
     /**
      * Execute a callable job.
      *
-     * @param callable $fn
+     * @param callable $fn Function to execute
      *
-     * @return string
+     * @return string Output from the function
      *
-     * @throws Exception
+     * @throws Exception If execution fails
      */
-    private function exec(callable $fn)
+    private function exec(callable $fn): string
     {
         ob_start();
 
@@ -487,30 +564,37 @@ class Job
 
         $outputBuffer = ob_get_clean();
 
+        // Write to output files if specified
         foreach ($this->outputTo as $filename) {
-            if ($outputBuffer) {
+            if ($outputBuffer !== false && $outputBuffer !== '') {
                 file_put_contents($filename, $outputBuffer, $this->outputMode === 'a' ? FILE_APPEND : 0);
             }
 
-            if ($returnData) {
+            if ($returnData && is_string($returnData)) {
                 file_put_contents($filename, $returnData, FILE_APPEND);
             }
         }
 
-        $this->removeLockFile();
+        $result = '';
+        if ($outputBuffer !== false) {
+            $result .= $outputBuffer;
+        }
+        if (is_string($returnData)) {
+            $result .= $returnData;
+        }
 
-        return $outputBuffer . (is_string($returnData) ? $returnData : '');
+        return $result;
     }
 
     /**
      * Set the file/s where to write the output of the job.
      *
-     * @param string|array $filename
-     * @param bool         $append
+     * @param string|array<int, string> $filename File path(s) to write output
+     * @param bool                      $append   Whether to append to existing files
      *
      * @return self
      */
-    public function output($filename, $append = false)
+    public function output(string|array $filename, bool $append = false): self
     {
         $this->outputTo = is_array($filename) ? $filename : [$filename];
         $this->outputMode = $append === false ? 'w' : 'a';
@@ -521,11 +605,21 @@ class Job
     /**
      * Get the job output.
      *
-     * @return mixed
+     * @return string|array<int, string>|null
      */
-    public function getOutput()
+    public function getOutput(): string|array
     {
         return $this->output;
+    }
+
+    /**
+     * Get the job return code.
+     *
+     * @return int
+     */
+    public function getReturnCode(): int
+    {
+        return $this->returnCode;
     }
 
     /**
@@ -533,11 +627,11 @@ class Job
      * The Job should be set to write output to a file
      * for this to work.
      *
-     * @param string|array $email
+     * @param string|array<int, string> $email Email address(es)
      *
      * @return self
      */
-    public function email($email)
+    public function email(string|array $email): self
     {
         if (!is_string($email) && !is_array($email)) {
             throw new InvalidArgumentException('The email can be only string or array');
@@ -552,7 +646,7 @@ class Job
     }
 
     /**
-     * Finilise the job after execution.
+     * Finalise the job after execution.
      *
      * @return void
      */
@@ -570,15 +664,16 @@ class Job
     /**
      * Email the output of the job, if any.
      *
-     * @return bool
+     * @return bool True if email was sent, false otherwise
      */
-    private function emailOutput()
+    private function emailOutput(): bool
     {
         if (!count($this->outputTo) || !count($this->emailTo)) {
             return false;
         }
 
-        if (isset($this->emailConfig['ignore_empty_output'])
+        if (
+            isset($this->emailConfig['ignore_empty_output'])
             && $this->emailConfig['ignore_empty_output'] === true
             && empty($this->output)
         ) {
@@ -594,11 +689,11 @@ class Job
      * Set function to be called before job execution
      * Job object is injected as a parameter to callable function.
      *
-     * @param callable $fn
+     * @param callable $fn Function to call before execution
      *
      * @return self
      */
-    public function before(callable $fn)
+    public function before(callable $fn): self
     {
         $this->before = $fn;
 
@@ -613,12 +708,12 @@ class Job
      * second parameter. The job will run in background if it
      * meets all the other criteria.
      *
-     * @param callable $fn
-     * @param bool     $runInBackground
+     * @param callable $fn              Function to call after execution
+     * @param bool     $runInBackground Whether to allow background execution
      *
      * @return self
      */
-    public function then(callable $fn, $runInBackground = false)
+    public function then(callable $fn, bool $runInBackground = false): self
     {
         $this->after = $fn;
 
