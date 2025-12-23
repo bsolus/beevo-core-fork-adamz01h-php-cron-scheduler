@@ -410,7 +410,7 @@ class Scheduler
         // Use a single lock file for all jobs (can be customized per job)
         $filePath = rtrim($directory, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'scheduler.lock';
 
-        return new FlockStore($filePath);
+        return new SchedulerFlockStore($filePath);
     }
 
     /**

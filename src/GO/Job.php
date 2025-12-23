@@ -292,13 +292,16 @@ class Job
      */
     public function isOverlapping(): bool
     {
-        if (!$this->lockable || !$this->scheduler) {
-            return false;
+        if (!$this->isLockable() || !$this->scheduler) {
+            return true;
         }
 
         try {
-            // Use scheduler to check for overlap
-            return $this->scheduler->isJobLocked($this->id);
+            if ($this->whenOverlapping === null) {
+                return false;
+            }
+
+            return (bool) call_user_func($this->whenOverlapping);
         } catch (Exception $e) {
             // Log error but don't fail the check
             error_log(sprintf('Failed to check overlap for job %s: %s', $this->id, $e->getMessage()));
@@ -466,14 +469,16 @@ class Job
         if ($this->truthTest !== true) {
             return false;
         }
-
-        // If overlapping and no callback to handle it, don't run
-        if ($this->lockable && !$this->acquireLock()) {
-            if ($this->whenOverlapping !== null) {
-                call_user_func($this->whenOverlapping);
+        if (!$this->acquireLock()) {
+            if (!$this->isOverlapping()) {
+                return false;
             }
 
-            return false;
+            error_log("Job '{$this->id}' is locked by another process, but overlapping allowed.");
+            $this->releaseLock();
+            if (!$this->acquireLock()) {
+                return false;
+            }
         }
 
         $compiled = $this->compile();
@@ -490,12 +495,12 @@ class Job
                 exec($compiled, $output, $this->returnCode);
                 $this->output = $output;
             }
+            $this->releaseLock();
         } catch (Exception $e) {
             $this->returnCode = 1;
             $this->output = ['Error: ' . $e->getMessage()];
         } finally {
             $this->finalise();
-            $this->releaseLock();
         }
 
         return true;
@@ -508,7 +513,7 @@ class Job
      */
     private function acquireLock(): bool
     {
-        if (!$this->lockable || !$this->scheduler) {
+        if (!$this->isLockable() || !$this->scheduler) {
             return true;
         }
 
